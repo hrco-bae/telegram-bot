@@ -4,7 +4,7 @@
 
 ## 프로젝트 개요
 
-텔레그램 봇("군대 관련 뉴스 텔레그램 봇")으로, 구글 뉴스 RSS에서 군대 관련 한글 뉴스를 수집해 매일 정해진 시간에 구독자들에게 전송합니다. Vercel 서버리스 배포를 전제로 **웹훅 방식**으로 동작하며, 폴링(`bot.launch`)이나 `node-cron` 같은 상시 실행 프로세스는 사용하지 않습니다.
+텔레그램 봇("군대 관련 뉴스 텔레그램 봇")으로, 구글 뉴스 RSS에서 군대·AI 관련 한글 뉴스를 주제별로 수집해 매일 정해진 시간에 구독자들에게 전송합니다. Vercel 서버리스 배포를 전제로 **웹훅 방식**으로 동작하며, 폴링(`bot.launch`)이나 `node-cron` 같은 상시 실행 프로세스는 사용하지 않습니다.
 
 ## 명령어
 
@@ -21,11 +21,11 @@
 ## 아키텍처
 
 - **`bot.js`**: 순수 모듈. Telegraf 인스턴스, 커맨드/액션 핸들러(`/start`, `/subscribe`, `/unsubscribe`, `/news`, 인라인 버튼 `subscribe`/`news_now`), 뉴스 수집·포맷팅 로직을 정의하고 `{ bot, sendNewsToSubscribers }`를 export합니다. **자체적으로 실행되지 않으며** `bot.launch()`나 스케줄러를 호출하지 않습니다 — `api/` 아래의 서버리스 함수가 이를 가져다 씁니다.
-  - **뉴스 수집**: `fetchMilitaryNews()` → `fetchFromGoogleNews()`가 axios로 `https://news.google.com/rss/search?q=military+korea&hl=ko&gl=KR&ceid=KR:ko`를 요청하고 cheerio로 RSS XML을 파싱합니다. 피드의 기본 링크가 깨져 있기 때문에 `<guid>` 요소로부터 기사 링크를 재구성합니다(`https://news.google.com/rss/articles/<guid>`). `isKorean()`은 한글 문자가 5자를 초과하는 제목만 통과시키며, 최대 5개 기사로 제한합니다.
+  - **뉴스 수집**: `NEWS_TOPICS` 배열(`military` — "military korea", `ai` — "인공지능 AI")에 정의된 주제별로 `fetchAllNews()`가 각각 `fetchFromGoogleNews(query)`를 호출합니다. 각 호출은 axios로 `https://news.google.com/rss/search?q=<query>&hl=ko&gl=KR&ceid=KR:ko`를 요청하고 cheerio로 RSS XML을 파싱합니다. 피드의 기본 링크가 깨져 있기 때문에 `<guid>` 요소로부터 기사 링크를 재구성합니다(`https://news.google.com/rss/articles/<guid>`). `isKorean()`은 한글 문자가 5자를 초과하는 제목만 통과시키며, 주제당 최대 5개 기사로 제한합니다. `formatNewsMessage()`는 주제별로 섹션을 나눠 하나의 메시지로 합칩니다. 새 주제를 추가하려면 `NEWS_TOPICS`에 `{ key, label, query }`만 추가하면 됩니다.
   - **저장소 (Upstash Redis, `@upstash/redis`)**: 플랫 JSON 파일 대신 Redis Set 두 개를 사용합니다(서버리스는 로컬 파일시스템이 휘발성/읽기전용이라 파일 저장이 불가능하기 때문).
     - `telegram-bot:subscribers` — 구독자 텔레그램 유저 ID 집합 (`getSubscribers`/`addSubscriber`/`removeSubscriber`/`isSubscriber`).
     - `telegram-bot:sent_news_urls` — 이미 전송한 기사 링크 집합 (`filterUnsentNews`/`markNewsSent`). 예약 전송(`sendNewsToSubscribers(true)`)만 이 이력으로 중복을 걸러내며, `/news` 즉시 조회는 이력과 무관하게 항상 현재 상위 5개를 보여줍니다.
-- **`api/webhook.js`**: 텔레그램이 호출하는 웹훅 엔드포인트. `bot.handleUpdate(req.body, res)`로 업데이트를 처리합니다(Vercel이 이미 JSON body를 파싱해주므로 telegraf의 `webhookCallback`이 아니라 `handleUpdate`를 직접 사용).
+- **`api/webhook.js`**: 텔레그램이 호출하는 웹훅 엔드포인트. `bot.handleUpdate(req.body)`로 업데이트를 처리합니다(Vercel이 이미 JSON body를 파싱해주므로 telegraf의 `webhookCallback`이 아니라 `handleUpdate`를 직접 사용). **`res`를 두 번째 인자로 넘기면 안 됨** — telegraf가 첫 번째 텔레그램 API 호출을 웹훅 응답에 실어보내며 응답을 즉시 끝내버려서, 그 뒤에 이어지는 비동기 처리(예: `/news`의 실제 뉴스 전송)가 완료되기 전에 서버리스 함수가 얼어붙는다. 처리가 다 끝난 뒤에만 `res.status(200).end()`로 응답한다.
 - **`api/send-news.js`**: 예약 뉴스 발송용 엔드포인트. `sendNewsToSubscribers(true)`를 호출합니다.
 - **`vercel.json`**: Vercel Cron이 매일 UTC 23:30(=서울 08:30)에 `/api/send-news`를 호출하도록 설정 — `node-cron`을 대체합니다.
 
