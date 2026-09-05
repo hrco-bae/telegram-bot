@@ -1,44 +1,53 @@
 const { Telegraf } = require('telegraf');
-const cron = require('node-cron');
 const axios = require('axios');
 const cheerio = require('cheerio');
-const fs = require('fs');
-const path = require('path');
+const { Redis } = require('@upstash/redis');
 require('dotenv').config();
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 if (!BOT_TOKEN) {
-  console.error('❌ 오류: BOT_TOKEN 환경변수가 설정되지 않았습니다.');
-  console.error('📝 .env 파일에서 BOT_TOKEN을 설정해주세요.');
-  process.exit(1);
+  throw new Error('BOT_TOKEN 환경변수가 설정되지 않았습니다. .env 파일을 확인해주세요.');
 }
 const bot = new Telegraf(BOT_TOKEN);
 
-// 설정 파일 경로
-const configFile = path.join(__dirname, 'news_config.json');
-const newsFile = path.join(__dirname, 'last_news.json');
+// Redis(Upstash) - 구독자 목록 & 중복전송 이력 저장
+// Vercel의 Upstash Redis 통합을 프로젝트에 연결하면 아래 env var가 자동으로 주입됩니다.
+const redis = new Redis({
+  url: process.env.UPSTASH_REDIS_REST_URL || process.env.KV_REST_API_URL,
+  token: process.env.UPSTASH_REDIS_REST_TOKEN || process.env.KV_REST_API_TOKEN
+});
 
-// 설정 로드/저장 함수
-const loadConfig = () => {
-  if (fs.existsSync(configFile)) {
-    return JSON.parse(fs.readFileSync(configFile, 'utf-8'));
-  }
-  return { subscribers: [] };
+const SUBSCRIBERS_KEY = 'telegram-bot:subscribers';
+const SENT_URLS_KEY = 'telegram-bot:sent_news_urls';
+
+const getSubscribers = async () => {
+  const ids = await redis.smembers(SUBSCRIBERS_KEY);
+  return ids.map(Number);
 };
 
-const saveConfig = (config) => {
-  fs.writeFileSync(configFile, JSON.stringify(config, null, 2));
+const addSubscriber = async (userId) => {
+  await redis.sadd(SUBSCRIBERS_KEY, userId);
 };
 
-const loadLastNews = () => {
-  if (fs.existsSync(newsFile)) {
-    return JSON.parse(fs.readFileSync(newsFile, 'utf-8'));
-  }
-  return { urls: new Set() };
+const removeSubscriber = async (userId) => {
+  await redis.srem(SUBSCRIBERS_KEY, userId);
 };
 
-const saveLastNews = (data) => {
-  fs.writeFileSync(newsFile, JSON.stringify({ urls: Array.from(data.urls) }, null, 2));
+const isSubscriber = async (userId) => {
+  return (await redis.sismember(SUBSCRIBERS_KEY, userId)) === 1;
+};
+
+// 이미 보낸 뉴스만 걸러내기
+const filterUnsentNews = async (newsList) => {
+  const sentFlags = await Promise.all(
+    newsList.map((news) => redis.sismember(SENT_URLS_KEY, news.link))
+  );
+  return newsList.filter((_, index) => sentFlags[index] !== 1);
+};
+
+const markNewsSent = async (newsList) => {
+  if (newsList.length === 0) return;
+  await redis.sadd(SENT_URLS_KEY, ...newsList.map((news) => news.link));
 };
 
 // 뉴스 검색 - 구글 뉴스 RSS 먼저 시도
@@ -127,13 +136,10 @@ const sendNewsToSubscribers = async (onlyNew = false) => {
       return;
     }
 
-    const config = loadConfig();
-    const lastNews = loadLastNews();
-
     // 새로운 뉴스만 필터링
     let newsToSend = newsList;
     if (onlyNew) {
-      newsToSend = newsList.filter(news => !lastNews.urls.includes(news.link));
+      newsToSend = await filterUnsentNews(newsList);
     }
 
     if (newsToSend.length === 0 && onlyNew) {
@@ -141,16 +147,13 @@ const sendNewsToSubscribers = async (onlyNew = false) => {
       return;
     }
 
-    // 뉴스 URL 저장
-    newsToSend.forEach(news => {
-      lastNews.urls.add(news.link);
-    });
-    saveLastNews(lastNews);
+    await markNewsSent(newsToSend);
 
     const message = formatNewsMessage(newsToSend);
+    const subscribers = await getSubscribers();
 
     // 구독자들에게 전송
-    for (const subscriberId of config.subscribers) {
+    for (const subscriberId of subscribers) {
       try {
         await bot.telegram.sendMessage(subscriberId, message, {
           parse_mode: 'Markdown',
@@ -190,15 +193,13 @@ bot.start((ctx) => {
 // 뉴스 구독
 bot.command('subscribe', async (ctx) => {
   const userId = ctx.from.id;
-  const config = loadConfig();
 
-  if (config.subscribers.includes(userId)) {
+  if (await isSubscriber(userId)) {
     ctx.reply('✅ 이미 뉴스 구독 중입니다!');
     return;
   }
 
-  config.subscribers.push(userId);
-  saveConfig(config);
+  await addSubscriber(userId);
 
   ctx.reply(
     '🔔 뉴스 구독 완료!\n\n' +
@@ -212,16 +213,13 @@ bot.command('subscribe', async (ctx) => {
 // 뉴스 구독 해제
 bot.command('unsubscribe', async (ctx) => {
   const userId = ctx.from.id;
-  const config = loadConfig();
 
-  const index = config.subscribers.indexOf(userId);
-  if (index === -1) {
+  if (!(await isSubscriber(userId))) {
     ctx.reply('❌ 현재 뉴스 구독 중이 아닙니다.');
     return;
   }
 
-  config.subscribers.splice(index, 1);
-  saveConfig(config);
+  await removeSubscriber(userId);
 
   ctx.reply('❌ 뉴스 구독이 취소되었습니다.');
   console.log(`❌ 사용자 ${userId}가 뉴스 구독을 취소했습니다.`);
@@ -243,11 +241,9 @@ bot.command('news', async (ctx) => {
 // 인라인 버튼 처리
 bot.action('subscribe', async (ctx) => {
   const userId = ctx.from.id;
-  const config = loadConfig();
 
-  if (!config.subscribers.includes(userId)) {
-    config.subscribers.push(userId);
-    saveConfig(config);
+  if (!(await isSubscriber(userId))) {
+    await addSubscriber(userId);
     ctx.answerCbQuery('✅ 뉴스 구독 완료!');
     ctx.editMessageText(
       '✅ 뉴스 구독 완료!\n\n' +
@@ -282,39 +278,4 @@ bot.on('text', (ctx) => {
   );
 });
 
-// 스케줄러: 매일 아침 8시 30분에 뉴스 전송
-console.log('⏰ 스케줄러 설정 중...');
-cron.schedule('30 8 * * *', async () => {
-  console.log('🔔 예약된 뉴스 전송 시작 (아침 8시 30분)');
-  await sendNewsToSubscribers(true); // 새로운 뉴스만 전송
-}, {
-  timezone: 'Asia/Seoul'
-});
-
-console.log('✅ 스케줄러 설정 완료 (매일 아침 8시 30분)');
-
-// 봇 시작
-bot.launch({
-  polling: {
-    timeout: 25,
-    limit: 100,
-    allowed_updates: ['message', 'callback_query']
-  }
-})
-  .then(() => {
-    console.log('🤖 봇이 실행 중입니다...');
-    console.log('⏰ 매일 아침 8시 30분에 뉴스가 자동으로 전송됩니다.');
-  })
-  .catch(err => {
-    console.error('❌ 봇 시작 실패:', err);
-    process.exit(1);
-  });
-
-process.once('SIGINT', () => {
-  console.log('\n봇 종료 중...');
-  bot.stop('SIGINT');
-});
-process.once('SIGTERM', () => {
-  console.log('\n봇 종료 중...');
-  bot.stop('SIGTERM');
-});
+module.exports = { bot, sendNewsToSubscribers };
