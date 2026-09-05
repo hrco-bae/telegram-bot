@@ -120,6 +120,9 @@ const fetchFromGoogleNews = async (query) => {
   }
 };
 
+// 제목에 [ ]가 들어있으면 마크다운 링크 문법과 충돌해 링크가 깨지므로 제거
+const sanitizeTitleForLink = (title) => title.replace(/[[\]]/g, '');
+
 // 뉴스를 포맷팅해서 메시지로 변환 (주제별 섹션으로 묶음)
 const formatNewsMessage = (newsByTopic) => {
   const sections = NEWS_TOPICS
@@ -129,7 +132,7 @@ const formatNewsMessage = (newsByTopic) => {
 
       let section = `*${topic.label}*\n\n`;
       newsList.forEach((news, index) => {
-        section += `${index + 1}. [${news.title}](${news.link})\n`;
+        section += `${index + 1}. [${sanitizeTitleForLink(news.title)}](${news.link})\n`;
         section += `   📰 ${news.source}\n\n`;
       });
       return section.trim();
