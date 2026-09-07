@@ -146,6 +146,41 @@ const formatNewsMessage = (newsByTopic) => {
   return sections.join('\n\n');
 };
 
+// 카카오워크는 텔레그램 Markdown 문법(*bold*, [title](url))을 지원하지 않으므로 평문으로 별도 포맷팅
+const formatNewsMessagePlain = (newsByTopic) => {
+  const sections = NEWS_TOPICS
+    .map((topic) => {
+      const newsList = newsByTopic[topic.key] || [];
+      if (newsList.length === 0) return null;
+
+      let section = `${topic.label}\n\n`;
+      newsList.forEach((news, index) => {
+        section += `${index + 1}. ${news.title}\n${news.link}\n\n`;
+      });
+      return section.trim();
+    })
+    .filter(Boolean);
+
+  if (sections.length === 0) {
+    return '📰 현재 검색된 뉴스가 없습니다.';
+  }
+
+  return sections.join('\n\n');
+};
+
+// 카카오워크 Incoming Webhook으로 메시지 전송 (KAKAOWORK_WEBHOOK_URL 미설정 시 건너뜀)
+const sendToKakaoWork = async (text) => {
+  const webhookUrl = process.env.KAKAOWORK_WEBHOOK_URL;
+  if (!webhookUrl) return;
+
+  try {
+    await axios.post(webhookUrl, { text }, { headers: { 'Content-Type': 'application/json' } });
+    console.log('✅ 카카오워크 전송 완료');
+  } catch (error) {
+    console.error('❌ 카카오워크 전송 실패:', error.message);
+  }
+};
+
 // 뉴스 전송 함수
 const sendNewsToSubscribers = async (onlyNew = false) => {
   try {
@@ -170,6 +205,8 @@ const sendNewsToSubscribers = async (onlyNew = false) => {
     await markNewsSent(allToSend);
 
     const message = formatNewsMessage(newsToSendByTopic);
+    await sendToKakaoWork(formatNewsMessagePlain(newsToSendByTopic));
+
     const subscribers = await getSubscribers();
 
     // 구독자들에게 전송

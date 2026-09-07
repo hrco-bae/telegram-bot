@@ -17,6 +17,7 @@
 `.env.example`을 참고해 다음 환경 변수가 필요합니다:
 - `BOT_TOKEN` — 없으면 `bot.js`를 require하는 시점에 예외가 발생합니다.
 - `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN` — 구독자 목록·중복전송 이력 저장용. Vercel 프로젝트에 Upstash Redis 통합(또는 레거시 Vercel KV, `KV_REST_API_URL`/`KV_REST_API_TOKEN`)을 연결하면 자동 주입됩니다.
+- `KAKAOWORK_WEBHOOK_URL` — (선택) 설정하면 예약 뉴스 전송 시 텔레그램과 함께 카카오워크 Incoming Webhook으로도 동일한 뉴스를 전달합니다. 비워두면 카카오워크 전송은 건너뜁니다.
 
 ## 아키텍처
 
@@ -25,6 +26,7 @@
   - **저장소 (Upstash Redis, `@upstash/redis`)**: 플랫 JSON 파일 대신 Redis Set 두 개를 사용합니다(서버리스는 로컬 파일시스템이 휘발성/읽기전용이라 파일 저장이 불가능하기 때문).
     - `telegram-bot:subscribers` — 구독자 텔레그램 유저 ID 집합 (`getSubscribers`/`addSubscriber`/`removeSubscriber`/`isSubscriber`).
     - `telegram-bot:sent_news_urls` — 이미 전송한 기사 링크 집합 (`filterUnsentNews`/`markNewsSent`). 예약 전송(`sendNewsToSubscribers(true)`)만 이 이력으로 중복을 걸러내며, `/news` 즉시 조회는 이력과 무관하게 항상 현재 상위 5개를 보여줍니다.
+  - **카카오워크 연동 (선택)**: `sendNewsToSubscribers`가 텔레그램 구독자에게 보내는 것과 별개로, `KAKAOWORK_WEBHOOK_URL`이 설정돼 있으면 `sendToKakaoWork()`가 같은 뉴스를 카카오워크 Incoming Webhook으로도 POST합니다. 카카오워크는 텔레그램 Markdown 문법(`*bold*`, `[title](url)`)을 지원하지 않으므로 `formatNewsMessagePlain()`으로 별도의 평문 메시지를 만들어 보냅니다.
 - **`api/webhook.js`**: 텔레그램이 호출하는 웹훅 엔드포인트. `bot.handleUpdate(req.body)`로 업데이트를 처리합니다(Vercel이 이미 JSON body를 파싱해주므로 telegraf의 `webhookCallback`이 아니라 `handleUpdate`를 직접 사용). **`res`를 두 번째 인자로 넘기면 안 됨** — telegraf가 첫 번째 텔레그램 API 호출을 웹훅 응답에 실어보내며 응답을 즉시 끝내버려서, 그 뒤에 이어지는 비동기 처리(예: `/news`의 실제 뉴스 전송)가 완료되기 전에 서버리스 함수가 얼어붙는다. 처리가 다 끝난 뒤에만 `res.status(200).end()`로 응답한다.
 - **`api/send-news.js`**: 예약 뉴스 발송용 엔드포인트. `sendNewsToSubscribers(true)`를 호출합니다.
 - **`vercel.json`**: Vercel Cron이 매일 UTC 23:30(=서울 08:30)에 `/api/send-news`를 호출하도록 설정 — `node-cron`을 대체합니다.
