@@ -146,35 +146,45 @@ const formatNewsMessage = (newsByTopic) => {
   return sections.join('\n\n');
 };
 
-// 카카오워크는 텔레그램 Markdown 문법(*bold*, [title](url))을 지원하지 않으므로 평문으로 별도 포맷팅
-const formatNewsMessagePlain = (newsByTopic) => {
-  const sections = NEWS_TOPICS
-    .map((topic) => {
-      const newsList = newsByTopic[topic.key] || [];
-      if (newsList.length === 0) return null;
+// 카카오워크는 텔레그램 Markdown 문법(*bold*, [title](url))을 지원하지 않으므로
+// Block Kit의 text block + link inline으로 제목에 직접 링크를 건다.
+const buildKakaoWorkBlocks = (newsByTopic) => {
+  const blocks = [];
 
-      let section = `${topic.label}\n\n`;
-      newsList.forEach((news, index) => {
-        section += `${index + 1}. ${news.title}\n${news.link}\n\n`;
+  NEWS_TOPICS.forEach((topic) => {
+    const newsList = newsByTopic[topic.key] || [];
+    if (newsList.length === 0) return;
+
+    blocks.push({ type: 'text', text: topic.label });
+
+    newsList.forEach((news, index) => {
+      const titleLine = `${index + 1}. ${news.title}`;
+      blocks.push({
+        type: 'text',
+        text: titleLine,
+        inlines: [{ type: 'link', text: titleLine, url: news.link }]
       });
-      return section.trim();
-    })
-    .filter(Boolean);
+      blocks.push({ type: 'text', text: `📰 ${news.source}` });
+    });
+  });
 
-  if (sections.length === 0) {
-    return '📰 현재 검색된 뉴스가 없습니다.';
-  }
-
-  return sections.join('\n\n');
+  return blocks;
 };
 
 // 카카오워크 Incoming Webhook으로 메시지 전송 (KAKAOWORK_WEBHOOK_URL 미설정 시 건너뜀)
-const sendToKakaoWork = async (text) => {
+const sendToKakaoWork = async (newsByTopic) => {
   const webhookUrl = process.env.KAKAOWORK_WEBHOOK_URL;
   if (!webhookUrl) return;
 
+  const blocks = buildKakaoWorkBlocks(newsByTopic);
+  if (blocks.length === 0) return;
+
   try {
-    await axios.post(webhookUrl, { text }, { headers: { 'Content-Type': 'application/json' } });
+    await axios.post(
+      webhookUrl,
+      { text: '📰 오늘의 군대·AI 관련 뉴스가 도착했습니다.', blocks },
+      { headers: { 'Content-Type': 'application/json' } }
+    );
     console.log('✅ 카카오워크 전송 완료');
   } catch (error) {
     console.error('❌ 카카오워크 전송 실패:', error.message);
@@ -186,7 +196,10 @@ const sendNewsToSubscribers = async (onlyNew = false) => {
   try {
     const newsByTopic = await fetchAllNews();
 
-    // 주제별로 새로운 뉴스만 필터링
+    // 카카오워크는 중복전송 이력과 무관하게 매번 주제별 상위 5개를 그대로 전송
+    await sendToKakaoWork(newsByTopic);
+
+    // 텔레그램 구독자에게는 주제별로 새로운 뉴스만 필터링해서 전송
     const newsToSendByTopic = {};
     for (const topic of NEWS_TOPICS) {
       let list = newsByTopic[topic.key] || [];
@@ -205,8 +218,6 @@ const sendNewsToSubscribers = async (onlyNew = false) => {
     await markNewsSent(allToSend);
 
     const message = formatNewsMessage(newsToSendByTopic);
-    await sendToKakaoWork(formatNewsMessagePlain(newsToSendByTopic));
-
     const subscribers = await getSubscribers();
 
     // 구독자들에게 전송
