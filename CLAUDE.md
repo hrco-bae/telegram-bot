@@ -4,7 +4,9 @@
 
 ## 프로젝트 개요
 
-텔레그램 봇("군대 관련 뉴스 텔레그램 봇")으로, 구글 뉴스 RSS에서 군대·AI 관련 한글 뉴스를 주제별로 수집해 매일 정해진 시간에 구독자들에게 전송합니다. Vercel 서버리스 배포를 전제로 **웹훅 방식**으로 동작하며, 폴링(`bot.launch`)이나 `node-cron` 같은 상시 실행 프로세스는 사용하지 않습니다.
+구글 뉴스 RSS에서 군대·AI 관련 한글 뉴스를 주제별로 수집해 매일 정해진 시간에 **카카오워크 Incoming Webhook**으로 전송하는 서비스입니다. Vercel 서버리스 배포를 전제로 동작하며, 상시 실행 프로세스(`node-cron` 등)는 사용하지 않습니다.
+
+과거에는 텔레그램 봇(구독자 관리, `/subscribe` 등)으로 동작했으나 텔레그램 연동은 완전히 제거되었고, 현재는 카카오워크로만 뉴스를 전송합니다.
 
 ## 명령어
 
@@ -15,24 +17,17 @@
 ## 설정
 
 `.env.example`을 참고해 다음 환경 변수가 필요합니다:
-- `BOT_TOKEN` — 없으면 `bot.js`를 require하는 시점에 예외가 발생합니다.
-- `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN` — 구독자 목록·중복전송 이력 저장용. Vercel 프로젝트에 Upstash Redis 통합(또는 레거시 Vercel KV, `KV_REST_API_URL`/`KV_REST_API_TOKEN`)을 연결하면 자동 주입됩니다.
-- `KAKAOWORK_WEBHOOK_URL` — (선택) 설정하면 예약 뉴스 전송 시 텔레그램과 함께 카카오워크 Incoming Webhook으로도 동일한 뉴스를 전달합니다. 비워두면 카카오워크 전송은 건너뜁니다.
+- `KAKAOWORK_WEBHOOK_URL` — 카카오워크 확장 서비스 > Incoming Webhook > Bot 만들기에서 발급받은 URL. 설정돼 있지 않으면 전송을 조용히 건너뜁니다(`sendToKakaoWork` 참고).
 
 ## 아키텍처
 
-- **`bot.js`**: 순수 모듈. Telegraf 인스턴스, 커맨드/액션 핸들러(`/start`, `/subscribe`, `/unsubscribe`, `/news`, 인라인 버튼 `subscribe`/`news_now`), 뉴스 수집·포맷팅 로직을 정의하고 `{ bot, sendNewsToSubscribers }`를 export합니다. **자체적으로 실행되지 않으며** `bot.launch()`나 스케줄러를 호출하지 않습니다 — `api/` 아래의 서버리스 함수가 이를 가져다 씁니다.
-  - **뉴스 수집**: `NEWS_TOPICS` 배열(`military` — "military korea", `ai` — "인공지능 AI")에 정의된 주제별로 `fetchAllNews()`가 각각 `fetchFromGoogleNews(query)`를 호출합니다. 각 호출은 axios로 `https://news.google.com/rss/search?q=<query>&hl=ko&gl=KR&ceid=KR:ko`를 요청하고 cheerio로 RSS XML을 파싱합니다. 피드의 기본 링크가 깨져 있기 때문에 `<guid>` 요소로부터 기사 링크를 재구성합니다(`https://news.google.com/rss/articles/<guid>`). `isKorean()`은 한글 문자가 5자를 초과하는 제목만 통과시키며, 주제당 최대 5개 기사로 제한합니다. `formatNewsMessage()`는 주제별로 섹션을 나눠 하나의 메시지로 합칩니다. 새 주제를 추가하려면 `NEWS_TOPICS`에 `{ key, label, query }`만 추가하면 됩니다.
-  - **저장소 (Upstash Redis, `@upstash/redis`)**: 플랫 JSON 파일 대신 Redis Set 두 개를 사용합니다(서버리스는 로컬 파일시스템이 휘발성/읽기전용이라 파일 저장이 불가능하기 때문).
-    - `telegram-bot:subscribers` — 구독자 텔레그램 유저 ID 집합 (`getSubscribers`/`addSubscriber`/`removeSubscriber`/`isSubscriber`).
-    - `telegram-bot:sent_news_urls` — 이미 전송한 기사 링크 집합 (`filterUnsentNews`/`markNewsSent`). 예약 전송(`sendNewsToSubscribers(true)`)만 이 이력으로 중복을 걸러내며, `/news` 즉시 조회는 이력과 무관하게 항상 현재 상위 5개를 보여줍니다.
-  - **카카오워크 연동 (선택)**: `sendNewsToSubscribers`가 텔레그램 구독자에게 보내는 것과 별개로, `KAKAOWORK_WEBHOOK_URL`이 설정돼 있으면 `sendToKakaoWork()`가 같은 뉴스를 카카오워크 Incoming Webhook으로도 POST합니다. 카카오워크는 텔레그램 Markdown 문법(`*bold*`, `[title](url)`)을 지원하지 않으므로 `formatNewsMessagePlain()`으로 별도의 평문 메시지를 만들어 보냅니다.
-- **`api/webhook.js`**: 텔레그램이 호출하는 웹훅 엔드포인트. `bot.handleUpdate(req.body)`로 업데이트를 처리합니다(Vercel이 이미 JSON body를 파싱해주므로 telegraf의 `webhookCallback`이 아니라 `handleUpdate`를 직접 사용). **`res`를 두 번째 인자로 넘기면 안 됨** — telegraf가 첫 번째 텔레그램 API 호출을 웹훅 응답에 실어보내며 응답을 즉시 끝내버려서, 그 뒤에 이어지는 비동기 처리(예: `/news`의 실제 뉴스 전송)가 완료되기 전에 서버리스 함수가 얼어붙는다. 처리가 다 끝난 뒤에만 `res.status(200).end()`로 응답한다.
-- **`api/send-news.js`**: 예약 뉴스 발송용 엔드포인트. `sendNewsToSubscribers(true)`를 호출합니다.
-- **`vercel.json`**: Vercel Cron이 매일 UTC 23:30(=서울 08:30)에 `/api/send-news`를 호출하도록 설정 — `node-cron`을 대체합니다.
-
-배포 시 Telegram에 `setWebhook`으로 `<배포 URL>/api/webhook`을 등록해야 하며, 로컬에서 폴링 방식으로 기존 `bot.js`를 실행하던 방식(`bot.launch`)은 더 이상 존재하지 않습니다.
+- **`news.js`**: 순수 모듈. 뉴스 수집·포맷팅·카카오워크 전송 로직을 정의하고 `{ sendNews }`를 export합니다. **자체적으로 실행되지 않으며** 스케줄러를 호출하지 않습니다 — `api/send-news.js`가 이를 가져다 씁니다.
+  - **뉴스 수집**: `NEWS_TOPICS` 배열(`military` — "military korea", `ai` — "인공지능 AI")에 정의된 주제별로 `fetchAllNews()`가 각각 `fetchFromGoogleNews(query)`를 호출합니다. 각 호출은 axios로 `https://news.google.com/rss/search?q=<query>&hl=ko&gl=KR&ceid=KR:ko`를 요청하고 cheerio로 RSS XML을 파싱합니다. 피드의 기본 링크가 깨져 있기 때문에 `<guid>` 요소로부터 기사 링크를 재구성합니다(`https://news.google.com/rss/articles/<guid>`). `isKorean()`은 한글 문자가 5자를 초과하는 제목만 통과시키며, 주제당 최대 5개 기사로 제한합니다. 새 주제를 추가하려면 `NEWS_TOPICS`에 `{ key, label, query }`만 추가하면 됩니다.
+  - **카카오워크 전송**: `sendNews()`는 매번 호출될 때마다 중복전송 이력과 무관하게 주제별 상위 5개를 그대로 가져와 `sendToKakaoWork()`로 전송합니다(별도의 저장소·구독자 목록 없음). 카카오워크는 텔레그램 Markdown 문법(`*bold*`, `[title](url)`)을 지원하지 않으므로, `buildKakaoWorkBlocks()`가 Block Kit의 `text` 블록 + `link` inline으로 기사 제목 자체에 하이퍼링크를 걸고 원본 URL 텍스트는 노출하지 않는다.
+- **`api/send-news.js`**: 예약 뉴스 발송용 엔드포인트. `sendNews()`를 호출합니다.
+- **`vercel.json`**: Vercel Cron이 매일 UTC 23:30(=서울 08:30)에 `/api/send-news`를 호출하도록 설정 — `node-cron`을 대체합니다. Vercel Hobby 플랜에서는 정확히 08:30이 아니라 최대 1시간 정도 지연될 수 있습니다.
 
 ## 금기 사항
 
 - 환경 변수는 `.env` 파일에 저장하고 절대 커밋하지 않습니다(`.gitignore`에 이미 등록되어 있음, `.env.example`에는 실제 값을 넣지 않음).
+- 카카오워크 Incoming Webhook URL은 그 자체로 인증 정보입니다(URL만 알면 누구나 해당 채팅방에 메시지를 보낼 수 있음) — 코드나 커밋, 대화 로그에 평문으로 남기지 않도록 주의합니다.
